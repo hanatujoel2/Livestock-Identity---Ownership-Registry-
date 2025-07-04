@@ -545,3 +545,382 @@
         (ok true)
     )
 )
+
+(define-map livestock-locations
+    { livestock-id: uint }
+    {
+        current-location: (string-ascii 100),
+        coordinates: (string-ascii 50),
+        location-type: (string-ascii 20),
+        updated-by: principal,
+        updated-at: uint,
+    }
+)
+
+(define-map livestock-location-history
+    {
+        livestock-id: uint,
+        movement-id: uint,
+    }
+    {
+        from-location: (string-ascii 100),
+        to-location: (string-ascii 100),
+        from-coordinates: (string-ascii 50),
+        to-coordinates: (string-ascii 50),
+        movement-date: uint,
+        movement-reason: (string-ascii 50),
+        transport-method: (string-ascii 30),
+        moved-by: principal,
+        verified: bool,
+    }
+)
+
+(define-map livestock-movement-last-id
+    { livestock-id: uint }
+    { last-movement-id: uint }
+)
+
+(define-read-only (get-livestock-location (livestock-id uint))
+    (map-get? livestock-locations { livestock-id: livestock-id })
+)
+
+(define-read-only (get-location-history
+        (livestock-id uint)
+        (movement-id uint)
+    )
+    (map-get? livestock-location-history {
+        livestock-id: livestock-id,
+        movement-id: movement-id,
+    })
+)
+
+(define-read-only (get-last-movement-id (livestock-id uint))
+    (default-to { last-movement-id: u0 }
+        (map-get? livestock-movement-last-id { livestock-id: livestock-id })
+    )
+)
+
+(define-public (set-initial-location
+        (livestock-id uint)
+        (location (string-ascii 100))
+        (coordinates (string-ascii 50))
+        (location-type (string-ascii 20))
+    )
+    (let ((livestock-data (map-get? livestock-registry { id: livestock-id })))
+        (asserts! (is-some livestock-data) (err u404))
+        (asserts! (is-eq tx-sender (get owner (unwrap-panic livestock-data)))
+            (err u403)
+        )
+        (asserts!
+            (is-none (map-get? livestock-locations { livestock-id: livestock-id }))
+            (err u409)
+        )
+        (map-set livestock-locations { livestock-id: livestock-id } {
+            current-location: location,
+            coordinates: coordinates,
+            location-type: location-type,
+            updated-by: tx-sender,
+            updated-at: burn-block-height,
+        })
+        (ok true)
+    )
+)
+
+(define-public (record-livestock-movement
+        (livestock-id uint)
+        (to-location (string-ascii 100))
+        (to-coordinates (string-ascii 50))
+        (movement-reason (string-ascii 50))
+        (transport-method (string-ascii 30))
+    )
+    (let (
+            (livestock-data (map-get? livestock-registry { id: livestock-id }))
+            (current-location-data (map-get? livestock-locations { livestock-id: livestock-id }))
+            (last-movement (get-last-movement-id livestock-id))
+            (new-movement-id (+ (get last-movement-id last-movement) u1))
+        )
+        (asserts! (is-some livestock-data) (err u404))
+        (asserts! (is-some current-location-data) (err u405))
+        (asserts! (is-eq tx-sender (get owner (unwrap-panic livestock-data)))
+            (err u403)
+        )
+        (map-set livestock-location-history {
+            livestock-id: livestock-id,
+            movement-id: new-movement-id,
+        } {
+            from-location: (get current-location (unwrap-panic current-location-data)),
+            to-location: to-location,
+            from-coordinates: (get coordinates (unwrap-panic current-location-data)),
+            to-coordinates: to-coordinates,
+            movement-date: burn-block-height,
+            movement-reason: movement-reason,
+            transport-method: transport-method,
+            moved-by: tx-sender,
+            verified: false,
+        })
+        (map-set livestock-locations { livestock-id: livestock-id }
+            (merge (unwrap-panic current-location-data) {
+                current-location: to-location,
+                coordinates: to-coordinates,
+                updated-by: tx-sender,
+                updated-at: burn-block-height,
+            })
+        )
+        (map-set livestock-movement-last-id { livestock-id: livestock-id } { last-movement-id: new-movement-id })
+        (ok new-movement-id)
+    )
+)
+
+(define-public (verify-movement
+        (livestock-id uint)
+        (movement-id uint)
+    )
+    (let (
+            (livestock-data (map-get? livestock-registry { id: livestock-id }))
+            (movement-data (map-get? livestock-location-history {
+                livestock-id: livestock-id,
+                movement-id: movement-id,
+            }))
+        )
+        (asserts! (is-some livestock-data) (err u404))
+        (asserts! (is-some movement-data) (err u405))
+        (asserts! (is-eq tx-sender (get owner (unwrap-panic livestock-data)))
+            (err u403)
+        )
+        (map-set livestock-location-history {
+            livestock-id: livestock-id,
+            movement-id: movement-id,
+        }
+            (merge (unwrap-panic movement-data) { verified: true })
+        )
+        (ok true)
+    )
+)
+
+(define-map livestock-certifications
+    {
+        livestock-id: uint,
+        cert-id: uint,
+    }
+    {
+        certification-type: (string-ascii 50),
+        issuing-authority: principal,
+        certificate-number: (string-ascii 100),
+        issue-date: uint,
+        expiry-date: uint,
+        status: (string-ascii 20),
+        requirements-met: (string-utf8 300),
+        inspector: principal,
+    }
+)
+
+(define-map livestock-compliance-checks
+    {
+        livestock-id: uint,
+        check-id: uint,
+    }
+    {
+        compliance-type: (string-ascii 50),
+        checker: principal,
+        check-date: uint,
+        result: (string-ascii 20),
+        score: uint,
+        notes: (string-utf8 400),
+        next-check-due: uint,
+    }
+)
+
+(define-map livestock-cert-last-id
+    { livestock-id: uint }
+    { last-cert-id: uint }
+)
+
+(define-map livestock-check-last-id
+    { livestock-id: uint }
+    { last-check-id: uint }
+)
+
+(define-map authorized-certifiers
+    { certifier: principal }
+    {
+        authorized: bool,
+        certification-types: (string-ascii 200),
+        authorized-by: principal,
+        authorized-date: uint,
+    }
+)
+
+(define-data-var contract-admin principal tx-sender)
+
+(define-read-only (get-certification
+        (livestock-id uint)
+        (cert-id uint)
+    )
+    (map-get? livestock-certifications {
+        livestock-id: livestock-id,
+        cert-id: cert-id,
+    })
+)
+
+(define-read-only (get-compliance-check
+        (livestock-id uint)
+        (check-id uint)
+    )
+    (map-get? livestock-compliance-checks {
+        livestock-id: livestock-id,
+        check-id: check-id,
+    })
+)
+
+(define-read-only (get-last-cert-id (livestock-id uint))
+    (default-to { last-cert-id: u0 }
+        (map-get? livestock-cert-last-id { livestock-id: livestock-id })
+    )
+)
+
+(define-read-only (get-last-check-id (livestock-id uint))
+    (default-to { last-check-id: u0 }
+        (map-get? livestock-check-last-id { livestock-id: livestock-id })
+    )
+)
+
+(define-read-only (is-authorized-certifier (certifier principal))
+    (match (map-get? authorized-certifiers { certifier: certifier })
+        auth-data (get authorized auth-data)
+        false
+    )
+)
+
+(define-public (authorize-certifier
+        (certifier principal)
+        (certification-types (string-ascii 200))
+    )
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-admin)) (err u401))
+        (map-set authorized-certifiers { certifier: certifier } {
+            authorized: true,
+            certification-types: certification-types,
+            authorized-by: tx-sender,
+            authorized-date: burn-block-height,
+        })
+        (ok true)
+    )
+)
+
+(define-public (issue-certification
+        (livestock-id uint)
+        (certification-type (string-ascii 50))
+        (certificate-number (string-ascii 100))
+        (validity-blocks uint)
+        (requirements-met (string-utf8 300))
+        (inspector principal)
+    )
+    (let (
+            (livestock-data (map-get? livestock-registry { id: livestock-id }))
+            (last-cert (get-last-cert-id livestock-id))
+            (new-cert-id (+ (get last-cert-id last-cert) u1))
+        )
+        (asserts! (is-some livestock-data) (err u404))
+        (asserts! (is-authorized-certifier tx-sender) (err u403))
+        (asserts! (> validity-blocks u0) (err u400))
+        (map-set livestock-certifications {
+            livestock-id: livestock-id,
+            cert-id: new-cert-id,
+        } {
+            certification-type: certification-type,
+            issuing-authority: tx-sender,
+            certificate-number: certificate-number,
+            issue-date: burn-block-height,
+            expiry-date: (+ burn-block-height validity-blocks),
+            status: "active",
+            requirements-met: requirements-met,
+            inspector: inspector,
+        })
+        (map-set livestock-cert-last-id { livestock-id: livestock-id } { last-cert-id: new-cert-id })
+        (ok new-cert-id)
+    )
+)
+
+(define-public (conduct-compliance-check
+        (livestock-id uint)
+        (compliance-type (string-ascii 50))
+        (result (string-ascii 20))
+        (score uint)
+        (notes (string-utf8 400))
+        (next-check-blocks uint)
+    )
+    (let (
+            (livestock-data (map-get? livestock-registry { id: livestock-id }))
+            (last-check (get-last-check-id livestock-id))
+            (new-check-id (+ (get last-check-id last-check) u1))
+        )
+        (asserts! (is-some livestock-data) (err u404))
+        (asserts! (is-authorized-certifier tx-sender) (err u403))
+        (asserts! (<= score u100) (err u400))
+        (map-set livestock-compliance-checks {
+            livestock-id: livestock-id,
+            check-id: new-check-id,
+        } {
+            compliance-type: compliance-type,
+            checker: tx-sender,
+            check-date: burn-block-height,
+            result: result,
+            score: score,
+            notes: notes,
+            next-check-due: (+ burn-block-height next-check-blocks),
+        })
+        (map-set livestock-check-last-id { livestock-id: livestock-id } { last-check-id: new-check-id })
+        (ok new-check-id)
+    )
+)
+
+(define-public (revoke-certification
+        (livestock-id uint)
+        (cert-id uint)
+    )
+    (let ((cert-data (map-get? livestock-certifications {
+            livestock-id: livestock-id,
+            cert-id: cert-id,
+        })))
+        (asserts! (is-some cert-data) (err u404))
+        (asserts!
+            (is-eq tx-sender (get issuing-authority (unwrap-panic cert-data)))
+            (err u403)
+        )
+        (map-set livestock-certifications {
+            livestock-id: livestock-id,
+            cert-id: cert-id,
+        }
+            (merge (unwrap-panic cert-data) { status: "revoked" })
+        )
+        (ok true)
+    )
+)
+
+(define-public (renew-certification
+        (livestock-id uint)
+        (cert-id uint)
+        (validity-blocks uint)
+    )
+    (let ((cert-data (map-get? livestock-certifications {
+            livestock-id: livestock-id,
+            cert-id: cert-id,
+        })))
+        (asserts! (is-some cert-data) (err u404))
+        (asserts!
+            (is-eq tx-sender (get issuing-authority (unwrap-panic cert-data)))
+            (err u403)
+        )
+        (asserts! (> validity-blocks u0) (err u400))
+        (map-set livestock-certifications {
+            livestock-id: livestock-id,
+            cert-id: cert-id,
+        }
+            (merge (unwrap-panic cert-data) {
+                expiry-date: (+ burn-block-height validity-blocks),
+                status: "active",
+            })
+        )
+        (ok true)
+    )
+)
