@@ -924,3 +924,250 @@
         (ok true)
     )
 )
+
+(define-map livestock-marketplace
+    { livestock-id: uint }
+    {
+        seller: principal,
+        price: uint,
+        listed-date: uint,
+        description: (string-utf8 300),
+        active: bool,
+    }
+)
+
+(define-map marketplace-offers
+    {
+        livestock-id: uint,
+        offer-id: uint,
+    }
+    {
+        buyer: principal,
+        offer-amount: uint,
+        offer-date: uint,
+        message: (string-utf8 200),
+        status: (string-ascii 20),
+    }
+)
+
+(define-map livestock-offer-last-id
+    { livestock-id: uint }
+    { last-offer-id: uint }
+)
+
+(define-read-only (get-marketplace-listing (livestock-id uint))
+    (map-get? livestock-marketplace { livestock-id: livestock-id })
+)
+
+(define-read-only (get-marketplace-offer
+        (livestock-id uint)
+        (offer-id uint)
+    )
+    (map-get? marketplace-offers {
+        livestock-id: livestock-id,
+        offer-id: offer-id,
+    })
+)
+
+(define-read-only (get-last-offer-id (livestock-id uint))
+    (default-to { last-offer-id: u0 }
+        (map-get? livestock-offer-last-id { livestock-id: livestock-id })
+    )
+)
+
+(define-public (list-livestock-for-sale
+        (livestock-id uint)
+        (price uint)
+        (description (string-utf8 300))
+    )
+    (let ((livestock-data (map-get? livestock-registry { id: livestock-id })))
+        (asserts! (is-some livestock-data) (err u404))
+        (asserts! (is-eq tx-sender (get owner (unwrap-panic livestock-data)))
+            (err u403)
+        )
+        (asserts! (> price u0) (err u400))
+        (asserts!
+            (is-none (map-get? livestock-marketplace { livestock-id: livestock-id }))
+            (err u408)
+        )
+        (map-set livestock-marketplace { livestock-id: livestock-id } {
+            seller: tx-sender,
+            price: price,
+            listed-date: burn-block-height,
+            description: description,
+            active: true,
+        })
+        (ok true)
+    )
+)
+
+(define-public (update-listing-price
+        (livestock-id uint)
+        (new-price uint)
+    )
+    (let ((listing-data (map-get? livestock-marketplace { livestock-id: livestock-id })))
+        (asserts! (is-some listing-data) (err u404))
+        (asserts! (is-eq tx-sender (get seller (unwrap-panic listing-data)))
+            (err u403)
+        )
+        (asserts! (get active (unwrap-panic listing-data)) (err u409))
+        (asserts! (> new-price u0) (err u400))
+        (map-set livestock-marketplace { livestock-id: livestock-id }
+            (merge (unwrap-panic listing-data) { price: new-price })
+        )
+        (ok true)
+    )
+)
+
+(define-public (remove-marketplace-listing (livestock-id uint))
+    (let ((listing-data (map-get? livestock-marketplace { livestock-id: livestock-id })))
+        (asserts! (is-some listing-data) (err u404))
+        (asserts! (is-eq tx-sender (get seller (unwrap-panic listing-data)))
+            (err u403)
+        )
+        (map-delete livestock-marketplace { livestock-id: livestock-id })
+        (ok true)
+    )
+)
+
+(define-public (make-offer
+        (livestock-id uint)
+        (offer-amount uint)
+        (message (string-utf8 200))
+    )
+    (let (
+            (listing-data (map-get? livestock-marketplace { livestock-id: livestock-id }))
+            (last-offer (get-last-offer-id livestock-id))
+            (new-offer-id (+ (get last-offer-id last-offer) u1))
+        )
+        (asserts! (is-some listing-data) (err u404))
+        (asserts! (get active (unwrap-panic listing-data)) (err u409))
+        (asserts! (> offer-amount u0) (err u400))
+        (asserts!
+            (not (is-eq tx-sender (get seller (unwrap-panic listing-data))))
+            (err u410)
+        )
+        (map-set marketplace-offers {
+            livestock-id: livestock-id,
+            offer-id: new-offer-id,
+        } {
+            buyer: tx-sender,
+            offer-amount: offer-amount,
+            offer-date: burn-block-height,
+            message: message,
+            status: "pending",
+        })
+        (map-set livestock-offer-last-id { livestock-id: livestock-id } { last-offer-id: new-offer-id })
+        (ok new-offer-id)
+    )
+)
+
+(define-public (accept-offer
+        (livestock-id uint)
+        (offer-id uint)
+    )
+    (let (
+            (listing-data (map-get? livestock-marketplace { livestock-id: livestock-id }))
+            (offer-data (map-get? marketplace-offers {
+                livestock-id: livestock-id,
+                offer-id: offer-id,
+            }))
+            (livestock-data (map-get? livestock-registry { id: livestock-id }))
+            (last-transfer (get-last-transfer-id livestock-id))
+            (new-transfer-id (+ (get last-transfer-id last-transfer) u1))
+        )
+        (asserts! (is-some listing-data) (err u404))
+        (asserts! (is-some offer-data) (err u405))
+        (asserts! (is-some livestock-data) (err u406))
+        (asserts! (is-eq tx-sender (get seller (unwrap-panic listing-data)))
+            (err u403)
+        )
+        (asserts! (is-eq "pending" (get status (unwrap-panic offer-data)))
+            (err u411)
+        )
+        (map-set marketplace-offers {
+            livestock-id: livestock-id,
+            offer-id: offer-id,
+        }
+            (merge (unwrap-panic offer-data) { status: "accepted" })
+        )
+        (map-set livestock-ownership-history {
+            livestock-id: livestock-id,
+            transfer-id: new-transfer-id,
+        } {
+            from: tx-sender,
+            to: (get buyer (unwrap-panic offer-data)),
+            transfer-date: burn-block-height,
+            price: (get offer-amount (unwrap-panic offer-data)),
+            notes: u"Marketplace sale",
+        })
+        (map-set livestock-registry { id: livestock-id }
+            (merge (unwrap-panic livestock-data) { owner: (get buyer (unwrap-panic offer-data)) })
+        )
+        (map-set livestock-ownership-last-transfer-id { livestock-id: livestock-id } { last-transfer-id: new-transfer-id })
+        (map-delete livestock-marketplace { livestock-id: livestock-id })
+        (ok new-transfer-id)
+    )
+)
+
+(define-public (reject-offer
+        (livestock-id uint)
+        (offer-id uint)
+    )
+    (let (
+            (listing-data (map-get? livestock-marketplace { livestock-id: livestock-id }))
+            (offer-data (map-get? marketplace-offers {
+                livestock-id: livestock-id,
+                offer-id: offer-id,
+            }))
+        )
+        (asserts! (is-some listing-data) (err u404))
+        (asserts! (is-some offer-data) (err u405))
+        (asserts! (is-eq tx-sender (get seller (unwrap-panic listing-data)))
+            (err u403)
+        )
+        (asserts! (is-eq "pending" (get status (unwrap-panic offer-data)))
+            (err u411)
+        )
+        (map-set marketplace-offers {
+            livestock-id: livestock-id,
+            offer-id: offer-id,
+        }
+            (merge (unwrap-panic offer-data) { status: "rejected" })
+        )
+        (ok true)
+    )
+)
+
+(define-public (purchase-livestock (livestock-id uint))
+    (let (
+            (listing-data (map-get? livestock-marketplace { livestock-id: livestock-id }))
+            (livestock-data (map-get? livestock-registry { id: livestock-id }))
+            (last-transfer (get-last-transfer-id livestock-id))
+            (new-transfer-id (+ (get last-transfer-id last-transfer) u1))
+        )
+        (asserts! (is-some listing-data) (err u404))
+        (asserts! (is-some livestock-data) (err u405))
+        (asserts! (get active (unwrap-panic listing-data)) (err u409))
+        (asserts!
+            (not (is-eq tx-sender (get seller (unwrap-panic listing-data))))
+            (err u410)
+        )
+        (map-set livestock-ownership-history {
+            livestock-id: livestock-id,
+            transfer-id: new-transfer-id,
+        } {
+            from: (get seller (unwrap-panic listing-data)),
+            to: tx-sender,
+            transfer-date: burn-block-height,
+            price: (get price (unwrap-panic listing-data)),
+            notes: u"Direct marketplace purchase",
+        })
+        (map-set livestock-registry { id: livestock-id }
+            (merge (unwrap-panic livestock-data) { owner: tx-sender })
+        )
+        (map-set livestock-ownership-last-transfer-id { livestock-id: livestock-id } { last-transfer-id: new-transfer-id })
+        (map-delete livestock-marketplace { livestock-id: livestock-id })
+        (ok new-transfer-id)
+    )
+)
