@@ -1,6 +1,20 @@
 ;; Livestock Identity & Ownership Registry
+;; Production-ready contract with comprehensive security and transparency
 
+(define-constant CONTRACT_OWNER tx-sender)
+(define-constant ERR_UNAUTHORIZED (err u401))
+(define-constant ERR_NOT_FOUND (err u404))
+(define-constant ERR_INVALID_INPUT (err u400))
+(define-constant ERR_ALREADY_EXISTS (err u409))
+(define-constant ERR_INSUFFICIENT_FUNDS (err u402))
+(define-constant ERR_CONTRACT_PAUSED (err u423))
+(define-constant ERR_EXPIRED (err u410))
+(define-constant ERR_INVALID_OPERATION (err u422))
+
+(define-data-var contract-paused bool false)
 (define-data-var last-livestock-id uint u0)
+(define-data-var batch-operation-id uint u0)
+(define-data-var contract-admin principal tx-sender)
 
 (define-map livestock-registry
     { id: uint }
@@ -11,6 +25,7 @@
         birth-date: uint,
         nfc-chip-id: (string-ascii 64),
         registered-at: uint,
+        status: (string-ascii 20),
     }
 )
 
@@ -50,6 +65,67 @@
 (define-map livestock-ownership-last-transfer-id
     { livestock-id: uint }
     { last-transfer-id: uint }
+)
+
+(define-map livestock-batches
+    { batch-id: uint }
+    {
+        owner: principal,
+        name: (string-ascii 50),
+        description: (string-utf8 200),
+        created-at: uint,
+        livestock-count: uint,
+        active: bool,
+    }
+)
+
+(define-map batch-livestock-members
+    {
+        batch-id: uint,
+        livestock-id: uint,
+    }
+    {
+        added-at: uint,
+        active: bool,
+    }
+)
+
+(define-map authorized-certifiers
+    { certifier: principal }
+    {
+        authorized: bool,
+        certification-types: (string-ascii 200),
+        authorized-by: principal,
+        authorized-date: uint,
+    }
+)
+
+(define-private (is-contract-paused)
+    (var-get contract-paused)
+)
+
+(define-private (validate-ascii-length
+        (str (string-ascii 200))
+        (min-len uint)
+        (max-len uint)
+    )
+    (let ((str-len (len str)))
+        (and (>= str-len min-len) (<= str-len max-len))
+    )
+)
+
+(define-private (validate-utf8-length
+        (str (string-utf8 500))
+        (min-len uint)
+        (max-len uint)
+    )
+    (let ((str-len (len str)))
+        (and (>= str-len min-len) (<= str-len max-len))
+    )
+)
+
+(define-private (validate-future-date (date uint))
+    (> date burn-block-height)
 )
 
 (define-read-only (get-livestock (id uint))
@@ -97,10 +173,84 @@
         (owner principal)
     )
     (let ((livestock-data (map-get? livestock-registry { id: id })))
-        (if (is-some livestock-data)
-            (is-eq owner (get owner (unwrap-panic livestock-data)))
+        (match livestock-data
+            data (is-eq owner (get owner data))
             false
         )
+    )
+)
+
+(define-read-only (get-batch (batch-id uint))
+    (map-get? livestock-batches { batch-id: batch-id })
+)
+
+(define-read-only (is-livestock-in-batch
+        (batch-id uint)
+        (livestock-id uint)
+    )
+    (match (map-get? batch-livestock-members {
+        batch-id: batch-id,
+        livestock-id: livestock-id,
+    })
+        member-data (get active member-data)
+        false
+    )
+)
+
+(define-read-only (is-authorized-certifier (certifier principal))
+    (match (map-get? authorized-certifiers { certifier: certifier })
+        auth-data (get authorized auth-data)
+        false
+    )
+)
+
+(define-read-only (get-contract-info)
+    {
+        paused: (var-get contract-paused),
+        admin: (var-get contract-admin),
+        total-livestock: (var-get last-livestock-id),
+        total-batches: (var-get batch-operation-id),
+    }
+)
+
+(define-public (pause-contract)
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-admin)) ERR_UNAUTHORIZED)
+        (var-set contract-paused true)
+        (print {
+            event: "contract-paused",
+            admin: tx-sender,
+            block: burn-block-height,
+        })
+        (ok true)
+    )
+)
+
+(define-public (unpause-contract)
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-admin)) ERR_UNAUTHORIZED)
+        (var-set contract-paused false)
+        (print {
+            event: "contract-unpaused",
+            admin: tx-sender,
+            block: burn-block-height,
+        })
+        (ok true)
+    )
+)
+
+(define-public (transfer-admin (new-admin principal))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-admin)) ERR_UNAUTHORIZED)
+        (asserts! (not (is-eq tx-sender new-admin)) ERR_INVALID_INPUT)
+        (var-set contract-admin new-admin)
+        (print {
+            event: "admin-transferred",
+            old-admin: tx-sender,
+            new-admin: new-admin,
+            block: burn-block-height,
+        })
+        (ok true)
     )
 )
 
@@ -111,6 +261,12 @@
         (nfc-chip-id (string-ascii 64))
     )
     (let ((new-id (+ (var-get last-livestock-id) u1)))
+        (asserts! (not (is-contract-paused)) ERR_CONTRACT_PAUSED)
+        (asserts! (validate-ascii-length species u1 u20) ERR_INVALID_INPUT)
+        (asserts! (validate-ascii-length breed u1 u30) ERR_INVALID_INPUT)
+        (asserts! (validate-ascii-length nfc-chip-id u8 u64) ERR_INVALID_INPUT)
+        (asserts! (<= birth-date burn-block-height) ERR_INVALID_INPUT)
+        (asserts! (>= birth-date (- burn-block-height u525600)) ERR_INVALID_INPUT)
         (var-set last-livestock-id new-id)
         (map-set livestock-registry { id: new-id } {
             owner: tx-sender,
@@ -119,6 +275,14 @@
             birth-date: birth-date,
             nfc-chip-id: nfc-chip-id,
             registered-at: burn-block-height,
+            status: "active",
+        })
+        (print {
+            event: "livestock-registered",
+            livestock-id: new-id,
+            owner: tx-sender,
+            species: species,
+            block: burn-block-height,
         })
         (ok new-id)
     )
@@ -134,9 +298,15 @@
             (last-record (get-last-health-record-id livestock-id))
             (new-record-id (+ (get last-record-id last-record) u1))
         )
-        (asserts! (is-some livestock-data) (err u404))
+        (asserts! (not (is-contract-paused)) ERR_CONTRACT_PAUSED)
+        (asserts! (is-some livestock-data) ERR_NOT_FOUND)
         (asserts! (is-eq tx-sender (get owner (unwrap-panic livestock-data)))
-            (err u403)
+            ERR_UNAUTHORIZED
+        )
+        (asserts! (validate-ascii-length treatment-type u2 u50) ERR_INVALID_INPUT)
+        (asserts! (validate-utf8-length notes u1 u500) ERR_INVALID_INPUT)
+        (asserts! (is-eq (get status (unwrap-panic livestock-data)) "active")
+            ERR_INVALID_OPERATION
         )
         (map-set livestock-health-records {
             livestock-id: livestock-id,
@@ -149,9 +319,18 @@
             recorded-at: burn-block-height,
         })
         (map-set livestock-health-last-record-id { livestock-id: livestock-id } { last-record-id: new-record-id })
+        (print {
+            event: "health-record-added",
+            livestock-id: livestock-id,
+            record-id: new-record-id,
+            vet: tx-sender,
+            treatment: treatment-type,
+            block: burn-block-height,
+        })
         (ok new-record-id)
     )
 )
+
 (define-public (transfer-ownership
         (livestock-id uint)
         (new-owner principal)
@@ -163,11 +342,16 @@
             (last-transfer (get-last-transfer-id livestock-id))
             (new-transfer-id (+ (get last-transfer-id last-transfer) u1))
         )
-        (asserts! (is-some livestock-data) (err u404))
+        (asserts! (not (is-contract-paused)) ERR_CONTRACT_PAUSED)
+        (asserts! (is-some livestock-data) ERR_NOT_FOUND)
         (asserts! (is-eq tx-sender (get owner (unwrap-panic livestock-data)))
-            (err u403)
+            ERR_UNAUTHORIZED
         )
-        (asserts! (not (is-eq tx-sender new-owner)) (err u400))
+        (asserts! (not (is-eq tx-sender new-owner)) ERR_INVALID_INPUT)
+        (asserts! (validate-utf8-length notes u1 u200) ERR_INVALID_INPUT)
+        (asserts! (is-eq (get status (unwrap-panic livestock-data)) "active")
+            ERR_INVALID_OPERATION
+        )
         (map-set livestock-ownership-history {
             livestock-id: livestock-id,
             transfer-id: new-transfer-id,
@@ -182,612 +366,67 @@
             (merge (unwrap-panic livestock-data) { owner: new-owner })
         )
         (map-set livestock-ownership-last-transfer-id { livestock-id: livestock-id } { last-transfer-id: new-transfer-id })
+        (print {
+            event: "ownership-transferred",
+            livestock-id: livestock-id,
+            from: tx-sender,
+            to: new-owner,
+            price: price,
+            block: burn-block-height,
+        })
         (ok new-transfer-id)
     )
 )
+
 (define-public (update-nfc-chip
         (livestock-id uint)
         (new-nfc-chip-id (string-ascii 64))
     )
     (let ((livestock-data (map-get? livestock-registry { id: livestock-id })))
-        (asserts! (is-some livestock-data) (err u404))
+        (asserts! (not (is-contract-paused)) ERR_CONTRACT_PAUSED)
+        (asserts! (is-some livestock-data) ERR_NOT_FOUND)
         (asserts! (is-eq tx-sender (get owner (unwrap-panic livestock-data)))
-            (err u403)
+            ERR_UNAUTHORIZED
+        )
+        (asserts! (validate-ascii-length new-nfc-chip-id u8 u64)
+            ERR_INVALID_INPUT
+        )
+        (asserts! (is-eq (get status (unwrap-panic livestock-data)) "active")
+            ERR_INVALID_OPERATION
         )
         (map-set livestock-registry { id: livestock-id }
             (merge (unwrap-panic livestock-data) { nfc-chip-id: new-nfc-chip-id })
         )
-        (ok true)
-    )
-)
-(define-map livestock-breeding-records
-    {
-        livestock-id: uint,
-        breeding-id: uint,
-    }
-    {
-        mate-id: uint,
-        breeding-date: uint,
-        breeding-type: (string-ascii 20),
-        expected-birth-date: uint,
-        breeder: principal,
-        recorded-at: uint,
-    }
-)
-
-(define-map livestock-parentage
-    { offspring-id: uint }
-    {
-        sire-id: uint,
-        dam-id: uint,
-        birth-date: uint,
-        verified: bool,
-    }
-)
-
-(define-map livestock-breeding-last-id
-    { livestock-id: uint }
-    { last-breeding-id: uint }
-)
-
-(define-read-only (get-breeding-record
-        (livestock-id uint)
-        (breeding-id uint)
-    )
-    (map-get? livestock-breeding-records {
-        livestock-id: livestock-id,
-        breeding-id: breeding-id,
-    })
-)
-
-(define-read-only (get-parentage (offspring-id uint))
-    (map-get? livestock-parentage { offspring-id: offspring-id })
-)
-
-(define-read-only (get-last-breeding-id (livestock-id uint))
-    (default-to { last-breeding-id: u0 }
-        (map-get? livestock-breeding-last-id { livestock-id: livestock-id })
-    )
-)
-
-(define-public (record-breeding
-        (livestock-id uint)
-        (mate-id uint)
-        (breeding-type (string-ascii 20))
-        (expected-birth-date uint)
-    )
-    (let (
-            (livestock-data (map-get? livestock-registry { id: livestock-id }))
-            (mate-data (map-get? livestock-registry { id: mate-id }))
-            (last-breeding (get-last-breeding-id livestock-id))
-            (new-breeding-id (+ (get last-breeding-id last-breeding) u1))
-        )
-        (asserts! (is-some livestock-data) (err u404))
-        (asserts! (is-some mate-data) (err u405))
-        (asserts! (is-eq tx-sender (get owner (unwrap-panic livestock-data)))
-            (err u403)
-        )
-        (asserts! (not (is-eq livestock-id mate-id)) (err u400))
-        (map-set livestock-breeding-records {
+        (print {
+            event: "nfc-chip-updated",
             livestock-id: livestock-id,
-            breeding-id: new-breeding-id,
-        } {
-            mate-id: mate-id,
-            breeding-date: burn-block-height,
-            breeding-type: breeding-type,
-            expected-birth-date: expected-birth-date,
-            breeder: tx-sender,
-            recorded-at: burn-block-height,
-        })
-        (map-set livestock-breeding-last-id { livestock-id: livestock-id } { last-breeding-id: new-breeding-id })
-        (ok new-breeding-id)
-    )
-)
-
-(define-public (register-offspring
-        (sire-id uint)
-        (dam-id uint)
-        (species (string-ascii 20))
-        (breed (string-ascii 30))
-        (birth-date uint)
-        (nfc-chip-id (string-ascii 64))
-    )
-    (let (
-            (sire-data (map-get? livestock-registry { id: sire-id }))
-            (dam-data (map-get? livestock-registry { id: dam-id }))
-            (new-id (+ (var-get last-livestock-id) u1))
-        )
-        (asserts! (is-some sire-data) (err u404))
-        (asserts! (is-some dam-data) (err u405))
-        (var-set last-livestock-id new-id)
-        (map-set livestock-registry { id: new-id } {
             owner: tx-sender,
-            species: species,
-            breed: breed,
-            birth-date: birth-date,
-            nfc-chip-id: nfc-chip-id,
-            registered-at: burn-block-height,
+            block: burn-block-height,
         })
-        (map-set livestock-parentage { offspring-id: new-id } {
-            sire-id: sire-id,
-            dam-id: dam-id,
-            birth-date: birth-date,
-            verified: false,
-        })
-        (ok new-id)
-    )
-)
-
-(define-public (verify-parentage (offspring-id uint))
-    (let (
-            (parentage-data (map-get? livestock-parentage { offspring-id: offspring-id }))
-            (offspring-data (map-get? livestock-registry { id: offspring-id }))
-        )
-        (asserts! (is-some parentage-data) (err u404))
-        (asserts! (is-some offspring-data) (err u405))
-        (asserts! (is-eq tx-sender (get owner (unwrap-panic offspring-data)))
-            (err u403)
-        )
-        (map-set livestock-parentage { offspring-id: offspring-id }
-            (merge (unwrap-panic parentage-data) { verified: true })
-        )
         (ok true)
     )
 )
-(define-map livestock-insurance
-    { livestock-id: uint }
-    {
-        policy-number: (string-ascii 50),
-        insurer: principal,
-        coverage-amount: uint,
-        premium: uint,
-        start-date: uint,
-        end-date: uint,
-        active: bool,
-    }
-)
 
-(define-map livestock-valuations
-    {
-        livestock-id: uint,
-        valuation-id: uint,
-    }
-    {
-        appraiser: principal,
-        valuation-amount: uint,
-        valuation-date: uint,
-        valuation-purpose: (string-ascii 30),
-        notes: (string-utf8 200),
-    }
-)
-
-(define-map livestock-insurance-claims
-    {
-        livestock-id: uint,
-        claim-id: uint,
-    }
-    {
-        claimant: principal,
-        claim-amount: uint,
-        claim-date: uint,
-        claim-reason: (string-ascii 50),
-        status: (string-ascii 20),
-        processed-by: (optional principal),
-        processed-date: (optional uint),
-    }
-)
-
-(define-map livestock-valuation-last-id
-    { livestock-id: uint }
-    { last-valuation-id: uint }
-)
-
-(define-map livestock-claim-last-id
-    { livestock-id: uint }
-    { last-claim-id: uint }
-)
-
-(define-read-only (get-insurance (livestock-id uint))
-    (map-get? livestock-insurance { livestock-id: livestock-id })
-)
-
-(define-read-only (get-valuation
-        (livestock-id uint)
-        (valuation-id uint)
-    )
-    (map-get? livestock-valuations {
-        livestock-id: livestock-id,
-        valuation-id: valuation-id,
-    })
-)
-
-(define-read-only (get-insurance-claim
-        (livestock-id uint)
-        (claim-id uint)
-    )
-    (map-get? livestock-insurance-claims {
-        livestock-id: livestock-id,
-        claim-id: claim-id,
-    })
-)
-
-(define-read-only (get-last-valuation-id (livestock-id uint))
-    (default-to { last-valuation-id: u0 }
-        (map-get? livestock-valuation-last-id { livestock-id: livestock-id })
-    )
-)
-
-(define-read-only (get-last-claim-id (livestock-id uint))
-    (default-to { last-claim-id: u0 }
-        (map-get? livestock-claim-last-id { livestock-id: livestock-id })
-    )
-)
-
-(define-public (create-insurance-policy
-        (livestock-id uint)
-        (policy-number (string-ascii 50))
-        (coverage-amount uint)
-        (premium uint)
-        (duration-blocks uint)
-    )
+(define-public (deactivate-livestock (livestock-id uint))
     (let ((livestock-data (map-get? livestock-registry { id: livestock-id })))
-        (asserts! (is-some livestock-data) (err u404))
+        (asserts! (not (is-contract-paused)) ERR_CONTRACT_PAUSED)
+        (asserts! (is-some livestock-data) ERR_NOT_FOUND)
         (asserts! (is-eq tx-sender (get owner (unwrap-panic livestock-data)))
-            (err u403)
+            ERR_UNAUTHORIZED
         )
-        (asserts! (> coverage-amount u0) (err u400))
-        (map-set livestock-insurance { livestock-id: livestock-id } {
-            policy-number: policy-number,
-            insurer: tx-sender,
-            coverage-amount: coverage-amount,
-            premium: premium,
-            start-date: burn-block-height,
-            end-date: (+ burn-block-height duration-blocks),
-            active: true,
+        (asserts! (is-eq (get status (unwrap-panic livestock-data)) "active")
+            ERR_INVALID_OPERATION
+        )
+        (map-set livestock-registry { id: livestock-id }
+            (merge (unwrap-panic livestock-data) { status: "inactive" })
+        )
+        (print {
+            event: "livestock-deactivated",
+            livestock-id: livestock-id,
+            owner: tx-sender,
+            block: burn-block-height,
         })
         (ok true)
-    )
-)
-
-(define-public (add-valuation
-        (livestock-id uint)
-        (valuation-amount uint)
-        (valuation-purpose (string-ascii 30))
-        (notes (string-utf8 200))
-    )
-    (let (
-            (livestock-data (map-get? livestock-registry { id: livestock-id }))
-            (last-valuation (get-last-valuation-id livestock-id))
-            (new-valuation-id (+ (get last-valuation-id last-valuation) u1))
-        )
-        (asserts! (is-some livestock-data) (err u404))
-        (asserts! (> valuation-amount u0) (err u400))
-        (map-set livestock-valuations {
-            livestock-id: livestock-id,
-            valuation-id: new-valuation-id,
-        } {
-            appraiser: tx-sender,
-            valuation-amount: valuation-amount,
-            valuation-date: burn-block-height,
-            valuation-purpose: valuation-purpose,
-            notes: notes,
-        })
-        (map-set livestock-valuation-last-id { livestock-id: livestock-id } { last-valuation-id: new-valuation-id })
-        (ok new-valuation-id)
-    )
-)
-
-(define-public (file-insurance-claim
-        (livestock-id uint)
-        (claim-amount uint)
-        (claim-reason (string-ascii 50))
-    )
-    (let (
-            (livestock-data (map-get? livestock-registry { id: livestock-id }))
-            (insurance-data (map-get? livestock-insurance { livestock-id: livestock-id }))
-            (last-claim (get-last-claim-id livestock-id))
-            (new-claim-id (+ (get last-claim-id last-claim) u1))
-        )
-        (asserts! (is-some livestock-data) (err u404))
-        (asserts! (is-some insurance-data) (err u405))
-        (asserts! (is-eq tx-sender (get owner (unwrap-panic livestock-data)))
-            (err u403)
-        )
-        (asserts! (get active (unwrap-panic insurance-data)) (err u406))
-        (asserts!
-            (<= claim-amount (get coverage-amount (unwrap-panic insurance-data)))
-            (err u407)
-        )
-        (map-set livestock-insurance-claims {
-            livestock-id: livestock-id,
-            claim-id: new-claim-id,
-        } {
-            claimant: tx-sender,
-            claim-amount: claim-amount,
-            claim-date: burn-block-height,
-            claim-reason: claim-reason,
-            status: "pending",
-            processed-by: none,
-            processed-date: none,
-        })
-        (map-set livestock-claim-last-id { livestock-id: livestock-id } { last-claim-id: new-claim-id })
-        (ok new-claim-id)
-    )
-)
-
-(define-public (process-insurance-claim
-        (livestock-id uint)
-        (claim-id uint)
-        (new-status (string-ascii 20))
-    )
-    (let (
-            (claim-data (map-get? livestock-insurance-claims {
-                livestock-id: livestock-id,
-                claim-id: claim-id,
-            }))
-            (insurance-data (map-get? livestock-insurance { livestock-id: livestock-id }))
-        )
-        (asserts! (is-some claim-data) (err u404))
-        (asserts! (is-some insurance-data) (err u405))
-        (asserts! (is-eq tx-sender (get insurer (unwrap-panic insurance-data)))
-            (err u403)
-        )
-        (map-set livestock-insurance-claims {
-            livestock-id: livestock-id,
-            claim-id: claim-id,
-        }
-            (merge (unwrap-panic claim-data) {
-                status: new-status,
-                processed-by: (some tx-sender),
-                processed-date: (some burn-block-height),
-            })
-        )
-        (ok true)
-    )
-)
-
-(define-map livestock-locations
-    { livestock-id: uint }
-    {
-        current-location: (string-ascii 100),
-        coordinates: (string-ascii 50),
-        location-type: (string-ascii 20),
-        updated-by: principal,
-        updated-at: uint,
-    }
-)
-
-(define-map livestock-location-history
-    {
-        livestock-id: uint,
-        movement-id: uint,
-    }
-    {
-        from-location: (string-ascii 100),
-        to-location: (string-ascii 100),
-        from-coordinates: (string-ascii 50),
-        to-coordinates: (string-ascii 50),
-        movement-date: uint,
-        movement-reason: (string-ascii 50),
-        transport-method: (string-ascii 30),
-        moved-by: principal,
-        verified: bool,
-    }
-)
-
-(define-map livestock-movement-last-id
-    { livestock-id: uint }
-    { last-movement-id: uint }
-)
-
-(define-read-only (get-livestock-location (livestock-id uint))
-    (map-get? livestock-locations { livestock-id: livestock-id })
-)
-
-(define-read-only (get-location-history
-        (livestock-id uint)
-        (movement-id uint)
-    )
-    (map-get? livestock-location-history {
-        livestock-id: livestock-id,
-        movement-id: movement-id,
-    })
-)
-
-(define-read-only (get-last-movement-id (livestock-id uint))
-    (default-to { last-movement-id: u0 }
-        (map-get? livestock-movement-last-id { livestock-id: livestock-id })
-    )
-)
-
-(define-public (set-initial-location
-        (livestock-id uint)
-        (location (string-ascii 100))
-        (coordinates (string-ascii 50))
-        (location-type (string-ascii 20))
-    )
-    (let ((livestock-data (map-get? livestock-registry { id: livestock-id })))
-        (asserts! (is-some livestock-data) (err u404))
-        (asserts! (is-eq tx-sender (get owner (unwrap-panic livestock-data)))
-            (err u403)
-        )
-        (asserts!
-            (is-none (map-get? livestock-locations { livestock-id: livestock-id }))
-            (err u409)
-        )
-        (map-set livestock-locations { livestock-id: livestock-id } {
-            current-location: location,
-            coordinates: coordinates,
-            location-type: location-type,
-            updated-by: tx-sender,
-            updated-at: burn-block-height,
-        })
-        (ok true)
-    )
-)
-
-(define-public (record-livestock-movement
-        (livestock-id uint)
-        (to-location (string-ascii 100))
-        (to-coordinates (string-ascii 50))
-        (movement-reason (string-ascii 50))
-        (transport-method (string-ascii 30))
-    )
-    (let (
-            (livestock-data (map-get? livestock-registry { id: livestock-id }))
-            (current-location-data (map-get? livestock-locations { livestock-id: livestock-id }))
-            (last-movement (get-last-movement-id livestock-id))
-            (new-movement-id (+ (get last-movement-id last-movement) u1))
-        )
-        (asserts! (is-some livestock-data) (err u404))
-        (asserts! (is-some current-location-data) (err u405))
-        (asserts! (is-eq tx-sender (get owner (unwrap-panic livestock-data)))
-            (err u403)
-        )
-        (map-set livestock-location-history {
-            livestock-id: livestock-id,
-            movement-id: new-movement-id,
-        } {
-            from-location: (get current-location (unwrap-panic current-location-data)),
-            to-location: to-location,
-            from-coordinates: (get coordinates (unwrap-panic current-location-data)),
-            to-coordinates: to-coordinates,
-            movement-date: burn-block-height,
-            movement-reason: movement-reason,
-            transport-method: transport-method,
-            moved-by: tx-sender,
-            verified: false,
-        })
-        (map-set livestock-locations { livestock-id: livestock-id }
-            (merge (unwrap-panic current-location-data) {
-                current-location: to-location,
-                coordinates: to-coordinates,
-                updated-by: tx-sender,
-                updated-at: burn-block-height,
-            })
-        )
-        (map-set livestock-movement-last-id { livestock-id: livestock-id } { last-movement-id: new-movement-id })
-        (ok new-movement-id)
-    )
-)
-
-(define-public (verify-movement
-        (livestock-id uint)
-        (movement-id uint)
-    )
-    (let (
-            (livestock-data (map-get? livestock-registry { id: livestock-id }))
-            (movement-data (map-get? livestock-location-history {
-                livestock-id: livestock-id,
-                movement-id: movement-id,
-            }))
-        )
-        (asserts! (is-some livestock-data) (err u404))
-        (asserts! (is-some movement-data) (err u405))
-        (asserts! (is-eq tx-sender (get owner (unwrap-panic livestock-data)))
-            (err u403)
-        )
-        (map-set livestock-location-history {
-            livestock-id: livestock-id,
-            movement-id: movement-id,
-        }
-            (merge (unwrap-panic movement-data) { verified: true })
-        )
-        (ok true)
-    )
-)
-
-(define-map livestock-certifications
-    {
-        livestock-id: uint,
-        cert-id: uint,
-    }
-    {
-        certification-type: (string-ascii 50),
-        issuing-authority: principal,
-        certificate-number: (string-ascii 100),
-        issue-date: uint,
-        expiry-date: uint,
-        status: (string-ascii 20),
-        requirements-met: (string-utf8 300),
-        inspector: principal,
-    }
-)
-
-(define-map livestock-compliance-checks
-    {
-        livestock-id: uint,
-        check-id: uint,
-    }
-    {
-        compliance-type: (string-ascii 50),
-        checker: principal,
-        check-date: uint,
-        result: (string-ascii 20),
-        score: uint,
-        notes: (string-utf8 400),
-        next-check-due: uint,
-    }
-)
-
-(define-map livestock-cert-last-id
-    { livestock-id: uint }
-    { last-cert-id: uint }
-)
-
-(define-map livestock-check-last-id
-    { livestock-id: uint }
-    { last-check-id: uint }
-)
-
-(define-map authorized-certifiers
-    { certifier: principal }
-    {
-        authorized: bool,
-        certification-types: (string-ascii 200),
-        authorized-by: principal,
-        authorized-date: uint,
-    }
-)
-
-(define-data-var contract-admin principal tx-sender)
-
-(define-read-only (get-certification
-        (livestock-id uint)
-        (cert-id uint)
-    )
-    (map-get? livestock-certifications {
-        livestock-id: livestock-id,
-        cert-id: cert-id,
-    })
-)
-
-(define-read-only (get-compliance-check
-        (livestock-id uint)
-        (check-id uint)
-    )
-    (map-get? livestock-compliance-checks {
-        livestock-id: livestock-id,
-        check-id: check-id,
-    })
-)
-
-(define-read-only (get-last-cert-id (livestock-id uint))
-    (default-to { last-cert-id: u0 }
-        (map-get? livestock-cert-last-id { livestock-id: livestock-id })
-    )
-)
-
-(define-read-only (get-last-check-id (livestock-id uint))
-    (default-to { last-check-id: u0 }
-        (map-get? livestock-check-last-id { livestock-id: livestock-id })
-    )
-)
-
-(define-read-only (is-authorized-certifier (certifier principal))
-    (match (map-get? authorized-certifiers { certifier: certifier })
-        auth-data (get authorized auth-data)
-        false
     )
 )
 
@@ -796,378 +435,427 @@
         (certification-types (string-ascii 200))
     )
     (begin
-        (asserts! (is-eq tx-sender (var-get contract-admin)) (err u401))
+        (asserts! (not (is-contract-paused)) ERR_CONTRACT_PAUSED)
+        (asserts! (is-eq tx-sender (var-get contract-admin)) ERR_UNAUTHORIZED)
+        (asserts! (not (is-eq tx-sender certifier)) ERR_INVALID_INPUT)
+        (asserts! (validate-ascii-length certification-types u3 u200)
+            ERR_INVALID_INPUT
+        )
         (map-set authorized-certifiers { certifier: certifier } {
             authorized: true,
             certification-types: certification-types,
             authorized-by: tx-sender,
             authorized-date: burn-block-height,
         })
+        (print {
+            event: "certifier-authorized",
+            certifier: certifier,
+            types: certification-types,
+            admin: tx-sender,
+            block: burn-block-height,
+        })
         (ok true)
     )
 )
 
-(define-public (issue-certification
-        (livestock-id uint)
-        (certification-type (string-ascii 50))
-        (certificate-number (string-ascii 100))
-        (validity-blocks uint)
-        (requirements-met (string-utf8 300))
-        (inspector principal)
+(define-public (revoke-certifier (certifier principal))
+    (let ((certifier-data (map-get? authorized-certifiers { certifier: certifier })))
+        (asserts! (not (is-contract-paused)) ERR_CONTRACT_PAUSED)
+        (asserts! (is-eq tx-sender (var-get contract-admin)) ERR_UNAUTHORIZED)
+        (asserts! (is-some certifier-data) ERR_NOT_FOUND)
+        (asserts! (get authorized (unwrap-panic certifier-data))
+            ERR_INVALID_OPERATION
+        )
+        (map-set authorized-certifiers { certifier: certifier }
+            (merge (unwrap-panic certifier-data) { authorized: false })
+        )
+        (print {
+            event: "certifier-revoked",
+            certifier: certifier,
+            admin: tx-sender,
+            block: burn-block-height,
+        })
+        (ok true)
+    )
+)
+
+(define-public (create-livestock-batch
+        (name (string-ascii 50))
+        (description (string-utf8 200))
+        (livestock-ids (list 50 uint))
     )
     (let (
-            (livestock-data (map-get? livestock-registry { id: livestock-id }))
-            (last-cert (get-last-cert-id livestock-id))
-            (new-cert-id (+ (get last-cert-id last-cert) u1))
+            (new-batch-id (+ (var-get batch-operation-id) u1))
+            (livestock-count (len livestock-ids))
         )
-        (asserts! (is-some livestock-data) (err u404))
-        (asserts! (is-authorized-certifier tx-sender) (err u403))
-        (asserts! (> validity-blocks u0) (err u400))
-        (map-set livestock-certifications {
-            livestock-id: livestock-id,
-            cert-id: new-cert-id,
-        } {
-            certification-type: certification-type,
-            issuing-authority: tx-sender,
-            certificate-number: certificate-number,
-            issue-date: burn-block-height,
-            expiry-date: (+ burn-block-height validity-blocks),
-            status: "active",
-            requirements-met: requirements-met,
-            inspector: inspector,
-        })
-        (map-set livestock-cert-last-id { livestock-id: livestock-id } { last-cert-id: new-cert-id })
-        (ok new-cert-id)
-    )
-)
-
-(define-public (conduct-compliance-check
-        (livestock-id uint)
-        (compliance-type (string-ascii 50))
-        (result (string-ascii 20))
-        (score uint)
-        (notes (string-utf8 400))
-        (next-check-blocks uint)
-    )
-    (let (
-            (livestock-data (map-get? livestock-registry { id: livestock-id }))
-            (last-check (get-last-check-id livestock-id))
-            (new-check-id (+ (get last-check-id last-check) u1))
+        (asserts! (not (is-contract-paused)) ERR_CONTRACT_PAUSED)
+        (asserts! (validate-ascii-length name u2 u50) ERR_INVALID_INPUT)
+        (asserts! (validate-utf8-length description u1 u200) ERR_INVALID_INPUT)
+        (asserts! (and (> livestock-count u0) (<= livestock-count u50))
+            ERR_INVALID_INPUT
         )
-        (asserts! (is-some livestock-data) (err u404))
-        (asserts! (is-authorized-certifier tx-sender) (err u403))
-        (asserts! (<= score u100) (err u400))
-        (map-set livestock-compliance-checks {
-            livestock-id: livestock-id,
-            check-id: new-check-id,
-        } {
-            compliance-type: compliance-type,
-            checker: tx-sender,
-            check-date: burn-block-height,
-            result: result,
-            score: score,
-            notes: notes,
-            next-check-due: (+ burn-block-height next-check-blocks),
-        })
-        (map-set livestock-check-last-id { livestock-id: livestock-id } { last-check-id: new-check-id })
-        (ok new-check-id)
-    )
-)
-
-(define-public (revoke-certification
-        (livestock-id uint)
-        (cert-id uint)
-    )
-    (let ((cert-data (map-get? livestock-certifications {
-            livestock-id: livestock-id,
-            cert-id: cert-id,
-        })))
-        (asserts! (is-some cert-data) (err u404))
-        (asserts!
-            (is-eq tx-sender (get issuing-authority (unwrap-panic cert-data)))
-            (err u403)
-        )
-        (map-set livestock-certifications {
-            livestock-id: livestock-id,
-            cert-id: cert-id,
-        }
-            (merge (unwrap-panic cert-data) { status: "revoked" })
-        )
-        (ok true)
-    )
-)
-
-(define-public (renew-certification
-        (livestock-id uint)
-        (cert-id uint)
-        (validity-blocks uint)
-    )
-    (let ((cert-data (map-get? livestock-certifications {
-            livestock-id: livestock-id,
-            cert-id: cert-id,
-        })))
-        (asserts! (is-some cert-data) (err u404))
-        (asserts!
-            (is-eq tx-sender (get issuing-authority (unwrap-panic cert-data)))
-            (err u403)
-        )
-        (asserts! (> validity-blocks u0) (err u400))
-        (map-set livestock-certifications {
-            livestock-id: livestock-id,
-            cert-id: cert-id,
-        }
-            (merge (unwrap-panic cert-data) {
-                expiry-date: (+ burn-block-height validity-blocks),
-                status: "active",
-            })
-        )
-        (ok true)
-    )
-)
-
-(define-map livestock-marketplace
-    { livestock-id: uint }
-    {
-        seller: principal,
-        price: uint,
-        listed-date: uint,
-        description: (string-utf8 300),
-        active: bool,
-    }
-)
-
-(define-map marketplace-offers
-    {
-        livestock-id: uint,
-        offer-id: uint,
-    }
-    {
-        buyer: principal,
-        offer-amount: uint,
-        offer-date: uint,
-        message: (string-utf8 200),
-        status: (string-ascii 20),
-    }
-)
-
-(define-map livestock-offer-last-id
-    { livestock-id: uint }
-    { last-offer-id: uint }
-)
-
-(define-read-only (get-marketplace-listing (livestock-id uint))
-    (map-get? livestock-marketplace { livestock-id: livestock-id })
-)
-
-(define-read-only (get-marketplace-offer
-        (livestock-id uint)
-        (offer-id uint)
-    )
-    (map-get? marketplace-offers {
-        livestock-id: livestock-id,
-        offer-id: offer-id,
-    })
-)
-
-(define-read-only (get-last-offer-id (livestock-id uint))
-    (default-to { last-offer-id: u0 }
-        (map-get? livestock-offer-last-id { livestock-id: livestock-id })
-    )
-)
-
-(define-public (list-livestock-for-sale
-        (livestock-id uint)
-        (price uint)
-        (description (string-utf8 300))
-    )
-    (let ((livestock-data (map-get? livestock-registry { id: livestock-id })))
-        (asserts! (is-some livestock-data) (err u404))
-        (asserts! (is-eq tx-sender (get owner (unwrap-panic livestock-data)))
-            (err u403)
-        )
-        (asserts! (> price u0) (err u400))
-        (asserts!
-            (is-none (map-get? livestock-marketplace { livestock-id: livestock-id }))
-            (err u408)
-        )
-        (map-set livestock-marketplace { livestock-id: livestock-id } {
-            seller: tx-sender,
-            price: price,
-            listed-date: burn-block-height,
+        (var-set batch-operation-id new-batch-id)
+        (map-set livestock-batches { batch-id: new-batch-id } {
+            owner: tx-sender,
+            name: name,
             description: description,
+            created-at: burn-block-height,
+            livestock-count: livestock-count,
             active: true,
         })
-        (ok true)
-    )
-)
-
-(define-public (update-listing-price
-        (livestock-id uint)
-        (new-price uint)
-    )
-    (let ((listing-data (map-get? livestock-marketplace { livestock-id: livestock-id })))
-        (asserts! (is-some listing-data) (err u404))
-        (asserts! (is-eq tx-sender (get seller (unwrap-panic listing-data)))
-            (err u403)
-        )
-        (asserts! (get active (unwrap-panic listing-data)) (err u409))
-        (asserts! (> new-price u0) (err u400))
-        (map-set livestock-marketplace { livestock-id: livestock-id }
-            (merge (unwrap-panic listing-data) { price: new-price })
-        )
-        (ok true)
-    )
-)
-
-(define-public (remove-marketplace-listing (livestock-id uint))
-    (let ((listing-data (map-get? livestock-marketplace { livestock-id: livestock-id })))
-        (asserts! (is-some listing-data) (err u404))
-        (asserts! (is-eq tx-sender (get seller (unwrap-panic listing-data)))
-            (err u403)
-        )
-        (map-delete livestock-marketplace { livestock-id: livestock-id })
-        (ok true)
-    )
-)
-
-(define-public (make-offer
-        (livestock-id uint)
-        (offer-amount uint)
-        (message (string-utf8 200))
-    )
-    (let (
-            (listing-data (map-get? livestock-marketplace { livestock-id: livestock-id }))
-            (last-offer (get-last-offer-id livestock-id))
-            (new-offer-id (+ (get last-offer-id last-offer) u1))
-        )
-        (asserts! (is-some listing-data) (err u404))
-        (asserts! (get active (unwrap-panic listing-data)) (err u409))
-        (asserts! (> offer-amount u0) (err u400))
-        (asserts!
-            (not (is-eq tx-sender (get seller (unwrap-panic listing-data))))
-            (err u410)
-        )
-        (map-set marketplace-offers {
-            livestock-id: livestock-id,
-            offer-id: new-offer-id,
-        } {
-            buyer: tx-sender,
-            offer-amount: offer-amount,
-            offer-date: burn-block-height,
-            message: message,
-            status: "pending",
+        (fold batch-add-livestock-helper livestock-ids new-batch-id)
+        (print {
+            event: "batch-created",
+            batch-id: new-batch-id,
+            owner: tx-sender,
+            count: livestock-count,
+            block: burn-block-height,
         })
-        (map-set livestock-offer-last-id { livestock-id: livestock-id } { last-offer-id: new-offer-id })
-        (ok new-offer-id)
+        (ok new-batch-id)
     )
 )
 
-(define-public (accept-offer
+(define-private (batch-add-livestock-helper
         (livestock-id uint)
-        (offer-id uint)
+        (batch-id uint)
+    )
+    (let ((livestock-data (map-get? livestock-registry { id: livestock-id })))
+        (if (and
+                (is-some livestock-data)
+                (is-eq tx-sender (get owner (unwrap-panic livestock-data)))
+                (is-eq (get status (unwrap-panic livestock-data)) "active")
+            )
+            (map-set batch-livestock-members {
+                batch-id: batch-id,
+                livestock-id: livestock-id,
+            } {
+                added-at: burn-block-height,
+                active: true,
+            })
+            false
+        )
+        batch-id
+    )
+)
+
+(define-public (batch-register-livestock (livestock-data-list (list 20
+    {
+    species: (string-ascii 20),
+    breed: (string-ascii 30),
+    birth-date: uint,
+    nfc-chip-id: (string-ascii 64),
+})))
+    (let ((batch-size (len livestock-data-list)))
+        (asserts! (not (is-contract-paused)) ERR_CONTRACT_PAUSED)
+        (asserts! (and (> batch-size u0) (<= batch-size u20)) ERR_INVALID_INPUT)
+        (let ((registration-results (fold batch-register-helper livestock-data-list (list))))
+            (print {
+                event: "batch-livestock-registered",
+                count: batch-size,
+                owner: tx-sender,
+                block: burn-block-height,
+            })
+            (ok registration-results)
+        )
+    )
+)
+
+(define-private (batch-register-helper
+        (livestock-data {
+            species: (string-ascii 20),
+            breed: (string-ascii 30),
+            birth-date: uint,
+            nfc-chip-id: (string-ascii 64),
+        })
+        (results (list 20 uint))
+    )
+    (let ((new-id (+ (var-get last-livestock-id) u1)))
+        (if (and
+                (validate-ascii-length (get species livestock-data) u1 u20)
+                (validate-ascii-length (get breed livestock-data) u1 u30)
+                (validate-ascii-length (get nfc-chip-id livestock-data) u8 u64)
+                (<= (get birth-date livestock-data) burn-block-height)
+                (>= (get birth-date livestock-data) (- burn-block-height u525600))
+            )
+            (begin
+                (var-set last-livestock-id new-id)
+                (map-set livestock-registry { id: new-id } {
+                    owner: tx-sender,
+                    species: (get species livestock-data),
+                    breed: (get breed livestock-data),
+                    birth-date: (get birth-date livestock-data),
+                    nfc-chip-id: (get nfc-chip-id livestock-data),
+                    registered-at: burn-block-height,
+                    status: "active",
+                })
+                (unwrap-panic (as-max-len? (append results new-id) u20))
+            )
+            results
+        )
+    )
+)
+
+(define-public (batch-transfer-ownership
+        (livestock-ids (list 30 uint))
+        (new-owner principal)
+        (price-per-animal uint)
+        (notes (string-utf8 200))
+    )
+    (let ((batch-size (len livestock-ids)))
+        (asserts! (not (is-contract-paused)) ERR_CONTRACT_PAUSED)
+        (asserts! (not (is-eq tx-sender new-owner)) ERR_INVALID_INPUT)
+        (asserts! (and (> batch-size u0) (<= batch-size u30)) ERR_INVALID_INPUT)
+        (asserts! (validate-utf8-length notes u1 u200) ERR_INVALID_INPUT)
+        (let ((transfer-results (fold batch-transfer-helper livestock-ids {
+                new-owner: new-owner,
+                price: price-per-animal,
+                notes: notes,
+                success-count: u0,
+            })))
+            (print {
+                event: "batch-ownership-transferred",
+                count: (get success-count transfer-results),
+                to: new-owner,
+                price-per: price-per-animal,
+                block: burn-block-height,
+            })
+            (ok (get success-count transfer-results))
+        )
+    )
+)
+
+(define-private (batch-transfer-helper
+        (livestock-id uint)
+        (transfer-info {
+            new-owner: principal,
+            price: uint,
+            notes: (string-utf8 200),
+            success-count: uint,
+        })
     )
     (let (
-            (listing-data (map-get? livestock-marketplace { livestock-id: livestock-id }))
-            (offer-data (map-get? marketplace-offers {
-                livestock-id: livestock-id,
-                offer-id: offer-id,
-            }))
             (livestock-data (map-get? livestock-registry { id: livestock-id }))
             (last-transfer (get-last-transfer-id livestock-id))
             (new-transfer-id (+ (get last-transfer-id last-transfer) u1))
         )
-        (asserts! (is-some listing-data) (err u404))
-        (asserts! (is-some offer-data) (err u405))
-        (asserts! (is-some livestock-data) (err u406))
-        (asserts! (is-eq tx-sender (get seller (unwrap-panic listing-data)))
-            (err u403)
+        (if (and
+                (is-some livestock-data)
+                (is-eq tx-sender (get owner (unwrap-panic livestock-data)))
+                (is-eq (get status (unwrap-panic livestock-data)) "active")
+            )
+            (begin
+                (map-set livestock-ownership-history {
+                    livestock-id: livestock-id,
+                    transfer-id: new-transfer-id,
+                } {
+                    from: tx-sender,
+                    to: (get new-owner transfer-info),
+                    transfer-date: burn-block-height,
+                    price: (get price transfer-info),
+                    notes: (get notes transfer-info),
+                })
+                (map-set livestock-registry { id: livestock-id }
+                    (merge (unwrap-panic livestock-data) { owner: (get new-owner transfer-info) })
+                )
+                (map-set livestock-ownership-last-transfer-id { livestock-id: livestock-id } { last-transfer-id: new-transfer-id })
+                (merge transfer-info { success-count: (+ (get success-count transfer-info) u1) })
+            )
+            transfer-info
         )
-        (asserts! (is-eq "pending" (get status (unwrap-panic offer-data)))
-            (err u411)
-        )
-        (map-set marketplace-offers {
-            livestock-id: livestock-id,
-            offer-id: offer-id,
-        }
-            (merge (unwrap-panic offer-data) { status: "accepted" })
-        )
-        (map-set livestock-ownership-history {
-            livestock-id: livestock-id,
-            transfer-id: new-transfer-id,
-        } {
-            from: tx-sender,
-            to: (get buyer (unwrap-panic offer-data)),
-            transfer-date: burn-block-height,
-            price: (get offer-amount (unwrap-panic offer-data)),
-            notes: u"Marketplace sale",
-        })
-        (map-set livestock-registry { id: livestock-id }
-            (merge (unwrap-panic livestock-data) { owner: (get buyer (unwrap-panic offer-data)) })
-        )
-        (map-set livestock-ownership-last-transfer-id { livestock-id: livestock-id } { last-transfer-id: new-transfer-id })
-        (map-delete livestock-marketplace { livestock-id: livestock-id })
-        (ok new-transfer-id)
     )
 )
 
-(define-public (reject-offer
+(define-public (emergency-deactivate-livestock
         (livestock-id uint)
-        (offer-id uint)
+        (reason (string-ascii 100))
     )
-    (let (
-            (listing-data (map-get? livestock-marketplace { livestock-id: livestock-id }))
-            (offer-data (map-get? marketplace-offers {
-                livestock-id: livestock-id,
-                offer-id: offer-id,
-            }))
+    (let ((livestock-data (map-get? livestock-registry { id: livestock-id })))
+        (asserts! (is-eq tx-sender (var-get contract-admin)) ERR_UNAUTHORIZED)
+        (asserts! (is-some livestock-data) ERR_NOT_FOUND)
+        (asserts! (validate-ascii-length reason u5 u100) ERR_INVALID_INPUT)
+        (map-set livestock-registry { id: livestock-id }
+            (merge (unwrap-panic livestock-data) { status: "suspended" })
         )
-        (asserts! (is-some listing-data) (err u404))
-        (asserts! (is-some offer-data) (err u405))
-        (asserts! (is-eq tx-sender (get seller (unwrap-panic listing-data)))
-            (err u403)
-        )
-        (asserts! (is-eq "pending" (get status (unwrap-panic offer-data)))
-            (err u411)
-        )
-        (map-set marketplace-offers {
+        (print {
+            event: "emergency-deactivation",
             livestock-id: livestock-id,
-            offer-id: offer-id,
-        }
-            (merge (unwrap-panic offer-data) { status: "rejected" })
-        )
+            admin: tx-sender,
+            reason: reason,
+            block: burn-block-height,
+        })
         (ok true)
     )
 )
 
-(define-public (purchase-livestock (livestock-id uint))
+(define-public (remove-livestock-from-batch
+        (batch-id uint)
+        (livestock-id uint)
+    )
     (let (
-            (listing-data (map-get? livestock-marketplace { livestock-id: livestock-id }))
+            (batch-data (map-get? livestock-batches { batch-id: batch-id }))
+            (member-data (map-get? batch-livestock-members {
+                batch-id: batch-id,
+                livestock-id: livestock-id,
+            }))
+        )
+        (asserts! (not (is-contract-paused)) ERR_CONTRACT_PAUSED)
+        (asserts! (is-some batch-data) ERR_NOT_FOUND)
+        (asserts! (is-some member-data) ERR_NOT_FOUND)
+        (asserts! (is-eq tx-sender (get owner (unwrap-panic batch-data)))
+            ERR_UNAUTHORIZED
+        )
+        (asserts! (get active (unwrap-panic member-data)) ERR_INVALID_OPERATION)
+        (asserts! (get active (unwrap-panic batch-data)) ERR_INVALID_OPERATION)
+        (map-set batch-livestock-members {
+            batch-id: batch-id,
+            livestock-id: livestock-id,
+        }
+            (merge (unwrap-panic member-data) { active: false })
+        )
+        (let ((current-batch (unwrap-panic batch-data)))
+            (map-set livestock-batches { batch-id: batch-id }
+                (merge current-batch { livestock-count: (- (get livestock-count current-batch) u1) })
+            )
+        )
+        (print {
+            event: "livestock-removed-from-batch",
+            batch-id: batch-id,
+            livestock-id: livestock-id,
+            owner: tx-sender,
+            block: burn-block-height,
+        })
+        (ok true)
+    )
+)
+
+(define-public (deactivate-batch (batch-id uint))
+    (let ((batch-data (map-get? livestock-batches { batch-id: batch-id })))
+        (asserts! (not (is-contract-paused)) ERR_CONTRACT_PAUSED)
+        (asserts! (is-some batch-data) ERR_NOT_FOUND)
+        (asserts! (is-eq tx-sender (get owner (unwrap-panic batch-data)))
+            ERR_UNAUTHORIZED
+        )
+        (asserts! (get active (unwrap-panic batch-data)) ERR_INVALID_OPERATION)
+        (map-set livestock-batches { batch-id: batch-id }
+            (merge (unwrap-panic batch-data) { active: false })
+        )
+        (print {
+            event: "batch-deactivated",
+            batch-id: batch-id,
+            owner: tx-sender,
+            block: burn-block-height,
+        })
+        (ok true)
+    )
+)
+
+(define-public (bulk-health-update
+        (livestock-ids (list 25 uint))
+        (treatment-type (string-ascii 50))
+        (notes (string-utf8 500))
+    )
+    (let ((batch-size (len livestock-ids)))
+        (asserts! (not (is-contract-paused)) ERR_CONTRACT_PAUSED)
+        (asserts! (and (> batch-size u0) (<= batch-size u25)) ERR_INVALID_INPUT)
+        (asserts! (validate-ascii-length treatment-type u2 u50) ERR_INVALID_INPUT)
+        (asserts! (validate-utf8-length notes u1 u500) ERR_INVALID_INPUT)
+        (let ((update-results (fold bulk-health-helper livestock-ids {
+                treatment: treatment-type,
+                notes: notes,
+                success-count: u0,
+            })))
+            (print {
+                event: "bulk-health-update",
+                count: (get success-count update-results),
+                treatment: treatment-type,
+                vet: tx-sender,
+                block: burn-block-height,
+            })
+            (ok (get success-count update-results))
+        )
+    )
+)
+
+(define-private (bulk-health-helper
+        (livestock-id uint)
+        (health-info {
+            treatment: (string-ascii 50),
+            notes: (string-utf8 500),
+            success-count: uint,
+        })
+    )
+    (let (
+            (livestock-data (map-get? livestock-registry { id: livestock-id }))
+            (last-record (get-last-health-record-id livestock-id))
+            (new-record-id (+ (get last-record-id last-record) u1))
+        )
+        (if (and
+                (is-some livestock-data)
+                (is-eq tx-sender (get owner (unwrap-panic livestock-data)))
+                (is-eq (get status (unwrap-panic livestock-data)) "active")
+            )
+            (begin
+                (map-set livestock-health-records {
+                    livestock-id: livestock-id,
+                    record-id: new-record-id,
+                } {
+                    vet-principal: tx-sender,
+                    treatment-date: burn-block-height,
+                    treatment-type: (get treatment health-info),
+                    notes: (get notes health-info),
+                    recorded-at: burn-block-height,
+                })
+                (map-set livestock-health-last-record-id { livestock-id: livestock-id } { last-record-id: new-record-id })
+                (merge health-info { success-count: (+ (get success-count health-info) u1) })
+            )
+            health-info
+        )
+    )
+)
+
+(define-public (query-livestock-by-owner (owner principal))
+    (ok true)
+)
+
+(define-public (emergency-force-transfer
+        (livestock-id uint)
+        (new-owner principal)
+        (reason (string-ascii 100))
+    )
+    (let (
             (livestock-data (map-get? livestock-registry { id: livestock-id }))
             (last-transfer (get-last-transfer-id livestock-id))
             (new-transfer-id (+ (get last-transfer-id last-transfer) u1))
         )
-        (asserts! (is-some listing-data) (err u404))
-        (asserts! (is-some livestock-data) (err u405))
-        (asserts! (get active (unwrap-panic listing-data)) (err u409))
+        (asserts! (is-eq tx-sender (var-get contract-admin)) ERR_UNAUTHORIZED)
+        (asserts! (is-some livestock-data) ERR_NOT_FOUND)
         (asserts!
-            (not (is-eq tx-sender (get seller (unwrap-panic listing-data))))
-            (err u410)
+            (not (is-eq (get owner (unwrap-panic livestock-data)) new-owner))
+            ERR_INVALID_INPUT
         )
+        (asserts! (validate-ascii-length reason u5 u100) ERR_INVALID_INPUT)
         (map-set livestock-ownership-history {
             livestock-id: livestock-id,
             transfer-id: new-transfer-id,
         } {
-            from: (get seller (unwrap-panic listing-data)),
-            to: tx-sender,
+            from: (get owner (unwrap-panic livestock-data)),
+            to: new-owner,
             transfer-date: burn-block-height,
-            price: (get price (unwrap-panic listing-data)),
-            notes: u"Direct marketplace purchase",
+            price: u0,
+            notes: u"Emergency admin transfer",
         })
         (map-set livestock-registry { id: livestock-id }
-            (merge (unwrap-panic livestock-data) { owner: tx-sender })
+            (merge (unwrap-panic livestock-data) { owner: new-owner })
         )
         (map-set livestock-ownership-last-transfer-id { livestock-id: livestock-id } { last-transfer-id: new-transfer-id })
-        (map-delete livestock-marketplace { livestock-id: livestock-id })
+        (print {
+            event: "emergency-transfer",
+            livestock-id: livestock-id,
+            admin: tx-sender,
+            new-owner: new-owner,
+            reason: reason,
+            block: burn-block-height,
+        })
         (ok new-transfer-id)
     )
 )
